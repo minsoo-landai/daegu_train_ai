@@ -13,34 +13,88 @@ from sklearn.metrics import roc_curve, auc
 import io
 from tensorflow.keras.callbacks import EarlyStopping
 import glob
+import subprocess, os, soundfile as sf
+import tempfile
+from tqdm import tqdm
 
 CLIP_DURATION = 3
 
 def load_audio(path, sr):
     try:
-        y, _ = librosa.load(path, sr=sr)
+        y, native_sr = sf.read(path)
+        if sr and native_sr != sr:
+            y = librosa.resample(y.T, orig_sr=native_sr, target_sr=sr)
         return y
     except Exception as e:
-        print(f"[WARN] librosa.load 실패, ffmpeg fallback 시도: {path}, err={e}")
-        try:
-            audio = AudioSegment.from_file(path)   # ffmpeg 필요
-            audio = audio.set_channels(1).set_frame_rate(sr)
-            y = np.array(audio.get_array_of_samples()).astype(np.float32) / (1<<15)
-            return y
-        except Exception as e2:
-            print(f"[ERROR] ffmpeg fallback도 실패: {path}, err={e2}")
+        print(f"[!] {path} 읽기 실패 ({e}) → ffmpeg 변환 시도")
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = tmp.name
+        result = subprocess.run([
+            "ffmpeg", "-y", "-i", path,
+            "-acodec", "pcm_s16le", "-ac", "1", "-ar", str(sr),
+            tmp_path
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        if result.returncode != 0 or not os.path.exists(tmp_path):
+            print(f"[X] ffmpeg 변환 실패: {path} → 파일 건너뜀")
             return None
+
+        y, _ = librosa.load(tmp_path, sr=sr)
+        os.remove(tmp_path)
+        return y
 
 def split_audio(y, sr):
     clip_len = int(sr * CLIP_DURATION)
-    return [y[i:i+clip_len] for i in range(0, len(y)-clip_len+1, clip_len)]
+    clips = []
+    for i in range(0, len(y), clip_len):
+        clip = y[i:i+clip_len]
+        if len(clip) < clip_len:
+            # 너무 짧으면 버리거나 패딩
+            continue
+        clips.append(clip)
+    return clips
 
 def compute_mfcc(y, sr):
-    return librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+    """
+    1) n_ffcc : DTW 계산시 사용하는 MFCC 특징 수
+    - 영향도 : 너무 적으면 정보 부족, 너무 많으면 민감성 증가
+    - 튜닝 팁 : 일반적으로 13~20 사이(기본 13) / 노이즈 환경에서는 축소 가능
+    - 각 오디오 클 [13 x T] 형태 행렬로 요약됨 (T : 시간 프레임 수)
+    2) MFCC : 사람의 청각 특성에 맞게 오디오 주파수 정보를 요약한 대표적 특징
+    - 추출 흐름 :
+        오디오 > 프레임 분할 > FFT(주파수 변환) > Mel Scale 필터 적용 > 로그화 > DCT > MRCC 벡터
+    """
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+    mfcc = mfcc.T   # (frames, 13)
+    # 빈 배열 방지
+    if mfcc.shape[0] == 0:  # 프레임 없으면 skip
+        return None
+    return mfcc
+
 
 def compute_dtw_distance(mfcc1, mfcc2):
-    D, _ = librosa.sequence.dtw(X=mfcc1, Y=mfcc2, metric='euclidean')
-    return D[-1, -1]
+    """
+    - D : 누적 비용 행렬 (두 시퀀스 매칭시키는데 드는 비용을 좌상단-우하단까지 계산한 2차원 배열)
+    - D[-1,-1] : 전체 매칭 끝났을 때 최종 비용 (최소 누적 거리)
+    - 두 전체 시퀀스 간 최종 DTW 거리
+
+    # 항상 (특징 차원, 시간 프레임) >>> (시간 프레임, 특징 차원) 변환
+    #### librosa.feature.mfcc 출력은 (n_mfcc, T) 형태 
+    #### mfcc = 13 / T = 프레임 수
+    #### librosa.sequence.dtw는 두 입력 행 개수가 같아야 (특징 차원 통일)
+    """
+    if mfcc1 is None or mfcc2 is None:
+        return None
+    # 두 입력 모두 (frames, features) 구조
+    if mfcc1.shape[1] != mfcc2.shape[1]:
+        print(f"[SKIP] Feature mismatch: {mfcc1.shape} vs {mfcc2.shape}")
+        return None
+    try:
+        D, _ = librosa.sequence.dtw(X=mfcc1, Y=mfcc2, metric='euclidean')
+        return D[-1, -1]
+    except Exception as e:
+        #print(f"[SKIP] DTW 실패: {e}")
+        return None
 
 def audio_to_spectrogram_image(y, sr):
     S = librosa.feature.melspectrogram(y=y, sr=sr)
@@ -100,6 +154,21 @@ def train_autoencoder(normal_paths, reference_path, model_save_path="autoencoder
 
     CLIP_DURATION = 3
 
+    # --- 파일 필터링 ---
+    print(f"[INFO] 원본 파일 개수: {len(normal_paths)}")
+    filtered_paths = []
+    for p in normal_paths:
+        y = load_audio(p, 16000)   # SR은 자동 선택 전이지만 대략 16k로 테스트
+        if y is not None and len(y) > 1000:  # 최소 길이 체크 (짧은 쓰레기 데이터 제외)
+            filtered_paths.append(p)
+        else:
+            print(f"[SKIP] 손상되었거나 너무 짧아서 제외 → {p}")
+
+    normal_paths = filtered_paths
+    print(f"[INFO] 사용 가능한 정상 파일 개수: {len(normal_paths)}")
+    print("")
+
+
     def suggest_sampling_rate(path, candidate_srs=[8000, 16000, 22050, 44100, 48000]):
         """
         - 적절한 sr 자동 선택해 고주파 특징을 보존하고 모델 입력 품질 향상
@@ -118,35 +187,6 @@ def train_autoencoder(normal_paths, reference_path, model_save_path="autoencoder
         best_sr = candidate_srs[np.argmax(high_energy_ratios)]    # 가장 높은 비율 보이는 SR 선택
         print(f"[✔] 자동 선택된 SR: {best_sr}Hz (고주파 에너지 반영)")
         return best_sr
-
-    def load_audio(path, sr):
-        y, _ = librosa.load(path, sr=sr)
-        return y
-
-    def split_audio(y, sr):
-        clip_len = sr * CLIP_DURATION
-        return [y[i:i+clip_len] for i in range(0, len(y)-clip_len+1, clip_len)]
-
-    def compute_mfcc(y, sr):
-        """
-        1) n_ffcc : DTW 계산시 사용하는 MFCC 특징 수
-        - 영향도 : 너무 적으면 정보 부족, 너무 많으면 민감성 증가
-        - 튜닝 팁 : 일반적으로 13~20 사이(기본 13) / 노이즈 환경에서는 축소 가능
-        - 각 오디오 클 [13 x T] 형태 행렬로 요약됨 (T : 시간 프레임 수)
-        2) MFCC : 사람의 청각 특성에 맞게 오디오 주파수 정보를 요약한 대표적 특징
-        - 추출 흐름 :
-          오디오 > 프레임 분할 > FFT(주파수 변환) > Mel Scale 필터 적용 > 로그화 > DCT > MRCC 벡터
-        """
-        return librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
-
-    def compute_dtw_distance(mfcc1, mfcc2):
-        """
-        - D : 누적 비용 행렬 (두 시퀀스 매칭시키는데 드는 비용을 좌상단-우하단까지 계산한 2차원 배열)
-        - D[-1,-1] : 전체 매칭 끝났을 때 최종 비용 (최소 누적 거리)
-        - 두 전체 시퀀스 간 최종 DTW 거리
-        """
-        D, _ = librosa.sequence.dtw(X=mfcc1, Y=mfcc2, metric='euclidean')
-        return D[-1, -1]
 
     def audio_to_spectrogram_image(y, sr):
         # 시간축, 주파수 축(Mel-scaled)  구성된 2D 에너지 분포
@@ -184,15 +224,27 @@ def train_autoencoder(normal_paths, reference_path, model_save_path="autoencoder
             2) 평균 + 표준편차 (Z-score)
         """
         ref_audio = load_audio(reference_path, sr)  # 정상 오디오
+        if ref_audio is None:
+            raise RuntimeError("[X] 참조 오디오 로드 실패")
+            
         ref_clip = split_audio(ref_audio, sr)[0]    # 참조 오디오 첫 3초 클립 > MFCC 특징 벡터
         ref_mfcc = compute_mfcc(ref_clip, sr)
-        dtw_scores = []
+        if ref_mfcc is None:
+            raise RuntimeError("[X] 참조 오디오에서 MFCC 추출 실패")
 
-        for path in normal_paths:
+        dtw_scores = []
+        
+        #for path in normal_paths:
+        for path in tqdm(normal_paths, desc="DTW threshold 계산중"):
             y = load_audio(path, sr)
+            if y is None:
+                continue
             for clip in split_audio(y, sr):         # 3초 단위 분할
                 mfcc = compute_mfcc(clip, sr)       # 각 클립을 참조 클립과 DTW 거리 계산
                 score = compute_dtw_distance(mfcc, ref_mfcc)    # DTW 거리 저장
+                if score is None:
+                    #print(f"[SKIP] DTW 실패: {path}")
+                    continue
                 dtw_scores.append(score)
 
         percentile_th = np.percentile(dtw_scores, percentile)   # 상위 10% 컷
@@ -234,10 +286,16 @@ def train_autoencoder(normal_paths, reference_path, model_save_path="autoencoder
         """
         X = []
         ref_y = load_audio(reference_path, sr)
+        if ref_y is None:
+            raise RuntimeError("[X] 참조 오디오 로드 실패")
+
         ref_mfcc = compute_mfcc(split_audio(ref_y, sr)[0], sr)
 
-        for path in normal_paths:
+        #for path in normal_paths:
+        for path in tqdm(normal_paths, desc="학습 데이터 준비중"):
             y = load_audio(path, sr)
+            if y is None:
+                continue 
             for clip in split_audio(y, sr):
                 mfcc = compute_mfcc(clip, sr)
                 score = compute_dtw_distance(mfcc, ref_mfcc)
@@ -289,6 +347,6 @@ def train_autoencoder(normal_paths, reference_path, model_save_path="autoencoder
     return model, sr, threshold
 
 normal_paths  = glob.glob('../deagu_manufacture_ai/data/train_data/sound/*.wav', recursive=True)   # 하위 디렉토리까지 재귀적으로 검색
-reference_path = "../deagu_manufacture_ai/data/reference/recording_20250819134401.wav"
+reference_path = "../deagu_manufacture_ai/data/reference/reference.wav"
 
 model, sr_used, dtw_threshold = train_autoencoder(normal_paths, reference_path)
