@@ -138,7 +138,7 @@ def suggest_sampling_rate(path):
         high_energy = np.sum(S[freqs > (sr / 4)])
         scores.append(high_energy / total_energy)
     best_sr = candidate_srs[np.argmax(scores)]
-    print(f"[\u2714] 자동 선택된 SR: {best_sr}Hz")
+    print(f"[자동 선택된 SR: {best_sr}Hz")
     return best_sr
 
 def train_autoencoder(normal_paths, reference_path, model_save_path="autoencoder.h5", thresholds_path="thresholds.npz", filter_strict=True):
