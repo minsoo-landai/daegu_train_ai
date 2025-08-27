@@ -22,9 +22,13 @@ CLIP_DURATION = 3
 def load_audio(path, sr):
     try:
         y, native_sr = sf.read(path)
+        # ★ 모노 변환 (stereo 등 다채널 안전 처리)
+        if y.ndim > 1:
+            y = np.mean(y, axis=1)
         if sr and native_sr != sr:
-            y = librosa.resample(y.T, orig_sr=native_sr, target_sr=sr)
-        return y
+            # librosa.resample은 마지막 축을 시간축으로 가정
+            y = librosa.resample(y, orig_sr=native_sr, target_sr=sr)
+        return y.astype(np.float32)
     except Exception as e:
         print(f"[!] {path} 읽기 실패 ({e}) → ffmpeg 변환 시도")
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
@@ -39,9 +43,9 @@ def load_audio(path, sr):
             print(f"[X] ffmpeg 변환 실패: {path} → 파일 건너뜀")
             return None
 
-        y, _ = librosa.load(tmp_path, sr=sr)
+        y, _ = librosa.load(tmp_path, sr=sr, mono=True)
         os.remove(tmp_path)
-        return y
+        return y.astype(np.float32)
 
 def split_audio(y, sr):
     clip_len = int(sr * CLIP_DURATION)
@@ -64,12 +68,10 @@ def compute_mfcc(y, sr):
     - 추출 흐름 :
         오디오 > 프레임 분할 > FFT(주파수 변환) > Mel Scale 필터 적용 > 로그화 > DCT > MRCC 벡터
     """
-    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
-    mfcc = mfcc.T   # (frames, 13)
-    # 빈 배열 방지
-    if mfcc.shape[0] == 0:  # 프레임 없으면 skip
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)  # (13, T)
+    if mfcc.shape[1] == 0:
         return None
-    return mfcc
+    return mfcc.T  
 
 
 def compute_dtw_distance(mfcc1, mfcc2):
@@ -85,13 +87,15 @@ def compute_dtw_distance(mfcc1, mfcc2):
     """
     if mfcc1 is None or mfcc2 is None:
         return None
-    # 두 입력 모두 (frames, features) 구조
+    # 둘 다 (frames, 13) 가정 → 특징 차원(=열)이 같은지 확인
     if mfcc1.shape[1] != mfcc2.shape[1]:
+        # 보통 13 != 13 이 아니므로 거의 안 뜸. 방어만 유지
         print(f"[SKIP] Feature mismatch: {mfcc1.shape} vs {mfcc2.shape}")
         return None
     try:
-        D, _ = librosa.sequence.dtw(X=mfcc1, Y=mfcc2, metric='euclidean')
-        return D[-1, -1]
+        # ★ DTW는 (d, n) 모양을 기대 → 전치해서 넘김
+        D, _ = librosa.sequence.dtw(X=mfcc1.T, Y=mfcc2.T, metric='euclidean')
+        return float(D[-1, -1])
     except Exception as e:
         #print(f"[SKIP] DTW 실패: {e}")
         return None
@@ -131,14 +135,14 @@ def suggest_sampling_rate(path):
     candidate_srs = [8000, 16000, 22050, 44100]
     scores = []
     for sr in candidate_srs:
-        y, _ = librosa.load(path, sr=sr, duration=5.0)
+        y, _ = librosa.load(path, sr=sr, duration=5.0, mono=True)
         S = np.abs(librosa.stft(y))
         freqs = librosa.fft_frequencies(sr=sr)
         total_energy = np.sum(S)
         high_energy = np.sum(S[freqs > (sr / 4)])
-        scores.append(high_energy / total_energy)
+        scores.append(high_energy / total_energy if total_energy > 0 else 0.0)
     best_sr = candidate_srs[np.argmax(scores)]
-    print(f"[자동 선택된 SR: {best_sr}Hz")
+    print(f"[자동 선택된 SR: {best_sr}Hz]")   # ★ 닫는 괄호 추가
     return best_sr
 
 def train_autoencoder(normal_paths, reference_path, model_save_path="autoencoder.h5", thresholds_path="thresholds.npz", filter_strict=True):
@@ -167,26 +171,6 @@ def train_autoencoder(normal_paths, reference_path, model_save_path="autoencoder
     normal_paths = filtered_paths
     print(f"[INFO] 사용 가능한 정상 파일 개수: {len(normal_paths)}")
     print("")
-
-
-    def suggest_sampling_rate(path, candidate_srs=[8000, 16000, 22050, 44100, 48000]):
-        """
-        - 적절한 sr 자동 선택해 고주파 특징을 보존하고 모델 입력 품질 향상
-        - 대표성 있으면서 계산이 빠르도록 5초간 오디오 불러와 STFT 수행 -> 스펙트럼 S 추출
-        """
-        high_energy_ratios = []
-        for sr in candidate_srs:
-            y, _ = librosa.load(path, sr=sr, duration=5.0)        # 5초간 오디오를 sr로 로드
-            # 시간에 따른 주파수 분포(=스펙트럼) 계산
-            S = np.abs(librosa.stft(y))                           # STFT 수행해 스펙트럼 추출 / abs() 진폭=에너지 근사값 변환
-            # 주파수 벡터 생성 (STFT 배열의 각 row가 몇 Hz 의미하는지 매핑)
-            freqs = librosa.fft_frequencies(sr=sr)                # 주파수 벡터 생성
-            total_energy = np.sum(S)
-            high_energy = np.sum(S[freqs > (sr / 4)])             # 고주파수 에너지 비중 계산 (1/4 이상을 고주파로 간주해 해당 대역 에너지 합산)
-            high_energy_ratios.append(high_energy / total_energy) # 비율 계산 (전체 에너지 중 고주파 비중 => 이 샘플레이트에서 고주파 정보 얼마나 살리)
-        best_sr = candidate_srs[np.argmax(high_energy_ratios)]    # 가장 높은 비율 보이는 SR 선택
-        print(f"[✔] 자동 선택된 SR: {best_sr}Hz (고주파 에너지 반영)")
-        return best_sr
 
     def audio_to_spectrogram_image(y, sr):
         # 시간축, 주파수 축(Mel-scaled)  구성된 2D 에너지 분포
@@ -227,14 +211,15 @@ def train_autoencoder(normal_paths, reference_path, model_save_path="autoencoder
         if ref_audio is None:
             raise RuntimeError("[X] 참조 오디오 로드 실패")
             
-        ref_clip = split_audio(ref_audio, sr)[0]    # 참조 오디오 첫 3초 클립 > MFCC 특징 벡터
-        ref_mfcc = compute_mfcc(ref_clip, sr)
+        ref_clips = split_audio(ref_audio, sr)
+        if not ref_clips:
+            raise RuntimeError("[X] 참조 오디오에서 3초 클립 생성 실패")
+
+        ref_mfcc = compute_mfcc(ref_clips[0], sr)
         if ref_mfcc is None:
             raise RuntimeError("[X] 참조 오디오에서 MFCC 추출 실패")
 
         dtw_scores = []
-        
-        #for path in normal_paths:
         for path in tqdm(normal_paths, desc="DTW threshold 계산중"):
             y = load_audio(path, sr)
             if y is None:
@@ -246,6 +231,10 @@ def train_autoencoder(normal_paths, reference_path, model_save_path="autoencoder
                     #print(f"[SKIP] DTW 실패: {path}")
                     continue
                 dtw_scores.append(score)
+
+        if len(dtw_scores) == 0:
+            print("[WARN] DTW 점수가 하나도 계산되지 않습니다. DTW 필터를 비활성화하고 AE만 사용합니다.")
+            return np.inf, dtw_scores
 
         percentile_th = np.percentile(dtw_scores, percentile)   # 상위 10% 컷
         # 평균보다 2표준편차 이상 벗어난 경우 이상값 (정규분포시 약 95% 범위) - 극단값 배제
@@ -288,22 +277,28 @@ def train_autoencoder(normal_paths, reference_path, model_save_path="autoencoder
         ref_y = load_audio(reference_path, sr)
         if ref_y is None:
             raise RuntimeError("[X] 참조 오디오 로드 실패")
-
         ref_mfcc = compute_mfcc(split_audio(ref_y, sr)[0], sr)
 
-        #for path in normal_paths:
         for path in tqdm(normal_paths, desc="학습 데이터 준비중"):
             y = load_audio(path, sr)
             if y is None:
-                continue 
+                continue
             for clip in split_audio(y, sr):
-                mfcc = compute_mfcc(clip, sr)
-                score = compute_dtw_distance(mfcc, ref_mfcc)
-                if not filter_strict or score < threshold:
+                use_clip = False
+                if np.isinf(threshold):  # ★ DTW 비활성화 시 모두 사용
+                    use_clip = True
+                else:
+                    mfcc = compute_mfcc(clip, sr)
+                    score = compute_dtw_distance(mfcc, ref_mfcc)
+                    if not filter_strict or (score is not None and score < threshold):
+                        use_clip = True
+                if use_clip:
                     img = audio_to_spectrogram_image(clip, sr)
                     X.append(img)
-
-        return np.array(X)
+        X = np.array(X)
+        if X.size == 0:
+            raise RuntimeError("[X] 학습에 사용할 샘플이 0개입니다. 입력 데이터/필터 조건을 확인하세요.")
+        return X
 
     # ----- 학습 시작 -----
     sr = suggest_sampling_rate(reference_path)
