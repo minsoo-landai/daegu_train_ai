@@ -145,7 +145,7 @@ def suggest_sampling_rate(path):
     print(f"[자동 선택된 SR: {best_sr}Hz]")   # ★ 닫는 괄호 추가
     return best_sr
 
-def train_autoencoder(normal_paths, reference_path, model_save_path="autoencoder.h5", thresholds_path="thresholds.npz", filter_strict=True):
+def train_autoencoder(normal_paths, reference_path, model_save_path="models/autoencoder.h5", thresholds_path="models/thresholds.npz", filter_strict=True):
     import os
     import librosa
     import librosa.display
