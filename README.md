@@ -55,5 +55,7 @@ graph TB
 ### 소리 모델
 <img width="1376" height="312" alt="image" src="https://github.com/user-attachments/assets/bdd1ed89-43ee-4874-9811-386a690e5568" />
 
+학습시, config 저장 >>> 이를 업데이트 한 후 탐지 실행. 
+
 ### 진동 모델
 <img width="1751" height="223" alt="image" src="https://github.com/user-attachments/assets/1917ccce-49f0-4007-b499-1e0638ed3f8d" />
