@@ -11,9 +11,43 @@ from fastdtw import fastdtw
 from scipy.spatial.distance import euclidean
 from tqdm import tqdm
 import glob
+import json
 
 #### GPU 하나로는 224 * 224 돌리기 어려움. OOM 
 #### CUDA_VISIBLE_DEVICES="" python vib_train.py
+
+def update_config_with_vibration_params(ae_min, ae_max, dtw_min, dtw_max, final_threshold):
+    """진동 학습에서 계산된 정규화 파라미터를 config.json에 저장"""
+    try:
+        config_path = "../deagu_manufacture_ai/config.json"
+        if os.path.exists(config_path):
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+        else:
+            config = {}
+        
+        # vibration 섹션이 없으면 생성
+        if "vibration" not in config:
+            config["vibration"] = {}
+        
+        # 정규화 파라미터 업데이트
+        config["vibration"]["ae_min"] = float(ae_min)
+        config["vibration"]["ae_max"] = float(ae_max)
+        config["vibration"]["dtw_min"] = float(dtw_min)
+        config["vibration"]["dtw_max"] = float(dtw_max)
+        config["vibration"]["final_threshold"] = float(final_threshold)
+        
+        # config.json 저장
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+        
+        print(f"[✔] 진동 정규화 파라미터가 config.json에 저장되었습니다:")
+        print(f"   AE 범위: {ae_min:.6f} ~ {ae_max:.6f}")
+        print(f"   DTW 범위: {dtw_min:.6f} ~ {dtw_max:.6f}")
+        print(f"   최종 임계값: {final_threshold:.6f}")
+        
+    except Exception as e:
+        print(f"[!] config.json 업데이트 실패: {e}")
 
 def load_and_preprocess_vibration_data_from_folder(folder_path, fs=16, duration=3):
     """
@@ -241,7 +275,7 @@ def train_vibration_cnn_ae_dtw(
     model_path="vib_cnn_ae.keras",
     threshold_path="vib_cnn_thresh.npy",
     cache_path="vib_images.npy",
-    fs=1000
+    fs=16
 ):
     """
     진동 이상 탐지를 위한 CNN AutoEncoder + DTW 모델을 학습합니다.
@@ -344,7 +378,17 @@ def train_vibration_cnn_ae_dtw(
     np.save(threshold_path, threshold)
     print(f"   임계값 저장 완료: {threshold_path} (90% 기준 = {threshold:.6f})")
 
-    # 10. 학습 결과 요약
+    # 10. 정규화 파라미터 계산 및 config.json 저장
+    print("   정규화 파라미터 계산 중...")
+    ae_min = np.min(ae_losses)
+    ae_max = np.max(ae_losses)
+    dtw_min = np.min(dtw_distances)
+    dtw_max = np.max(dtw_distances)
+    
+    # config.json에 정규화 파라미터 저장
+    update_config_with_vibration_params(ae_min, ae_max, dtw_min, dtw_max, threshold)
+
+    # 11. 학습 결과 요약
     print(f"\n학습 결과 요약")
     print(f"   최종 검증 손실: {min(history.history['val_loss']):.6f}")
     print(f"   학습 에포크: {len(history.history['val_loss'])}")

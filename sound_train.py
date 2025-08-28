@@ -16,6 +16,7 @@ import glob
 import subprocess, os, soundfile as sf
 import tempfile
 from tqdm import tqdm
+import json # config 수정 
 
 CLIP_DURATION = 3
 
@@ -144,6 +145,41 @@ def suggest_sampling_rate(path):
     best_sr = candidate_srs[np.argmax(scores)]
     print(f"[자동 선택된 SR: {best_sr}Hz]")   # ★ 닫는 괄호 추가
     return best_sr
+
+def update_config_with_normalization_params(ae_min, ae_max, dtw_min, dtw_max, ae_threshold, dtw_threshold):
+    """학습에서 계산된 정규화 파라미터를 config.json에 저장"""
+    try:
+        config_path = "config.json"
+        if os.path.exists(config_path):
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+        else:
+            config = {}
+        
+        # detection 섹션이 없으면 생성
+        if "detection" not in config:
+            config["detection"] = {}
+        
+        # 정규화 파라미터 업데이트
+        config["detection"]["ae_min"] = float(ae_min)
+        config["detection"]["ae_max"] = float(ae_max)
+        config["detection"]["dtw_min"] = float(dtw_min)
+        config["detection"]["dtw_max"] = float(dtw_max)
+        config["detection"]["ae_threshold"] = float(ae_threshold)
+        config["detection"]["dtw_threshold"] = float(dtw_threshold)
+        
+        # config.json 저장
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+        
+        print(f"[✔] 정규화 파라미터가 config.json에 저장되었습니다:")
+        print(f"   AE 범위: {ae_min:.6f} ~ {ae_max:.6f}")
+        print(f"   DTW 범위: {dtw_min:.2f} ~ {dtw_max:.2f}")
+        print(f"   AE 임계값: {ae_threshold:.6f}")
+        print(f"   DTW 임계값: {dtw_threshold:.2f}")
+        
+    except Exception as e:
+        print(f"[!] config.json 업데이트 실패: {e}")
 
 def train_autoencoder(normal_paths, reference_path, model_save_path="models/autoencoder.h5", thresholds_path="models/thresholds.npz", filter_strict=True):
     import os
@@ -314,7 +350,7 @@ def train_autoencoder(normal_paths, reference_path, model_save_path="models/auto
 
     history = model.fit(X_train, X_train,
                         epochs=300, #100
-                        batch_size=16,
+                        batch_size=8,
                         validation_data=(X_val, X_val),
                         shuffle=True,
                         callbacks=[early_stopping])
@@ -327,6 +363,15 @@ def train_autoencoder(normal_paths, reference_path, model_save_path="models/auto
     ae_threshold = np.percentile(ae_losses, 90)
     np.savez(thresholds_path, ae_threshold=ae_threshold, dtw_threshold=threshold)
     print(f"[✔] Thresholds 저장됨 → {thresholds_path}")
+
+    # 정규화 파라미터 계산
+    ae_min = np.min(ae_losses)
+    ae_max = np.max(ae_losses)
+    dtw_min = np.min(dtw_scores) if len(dtw_scores) > 0 else 0.0
+    dtw_max = np.max(dtw_scores) if len(dtw_scores) > 0 else 1.0
+    
+    # config.json에 정규화 파라미터 저장
+    update_config_with_normalization_params(ae_min, ae_max, dtw_min, dtw_max, ae_threshold, threshold)
 
     # AE Loss 분포 시각화
     plt.figure(figsize=(10, 4))
